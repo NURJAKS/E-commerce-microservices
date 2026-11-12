@@ -1,0 +1,32 @@
+title = "NovaShop Monorepo Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "telegram-bot-token"
+description = "Telegram Bot API Token"
+regex = '''\b[0-9]{8,10}:[a-zA-Z0-9_-]{35}\b'''
+tags = ["secret", "telegram"]
+
+[[rules]]
+id = "private-key-block"
+description = "Cryptographic Private Key"
+regex = '''-----BEGIN (RSA|EC|DSA|OPENSSH|PGP|PRIVATE) KEY-----'''
+tags = ["secret", "private-key"]
+
+[[rules]]
+id = "hardcoded-jwt-production-secret"
+description = "Hardcoded Production JWT Secret"
+regex = '''(?i)jwt[_-]?secret\s*[:=]\s*["'][a-zA-Z0-9_\-!@#$%^&*()]{32,}["']'''
+tags = ["secret", "jwt"]
+
+[allowlist]
+description = "Allow local development templates, Docker Compose dev defaults, and unit test fixtures"
+paths = [
+  '''^\.env\.example$''',
+  '''^docker-compose\.yml$''',
+  '''^README\.md$''',
+  '''\.spec\.ts$''',
+  '''^load-tests/.*\.js$'''
+]

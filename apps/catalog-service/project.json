@@ -1,0 +1,7 @@
+{
+  "name": "catalog-service",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "apps/catalog-service/src",
+  "projectType": "application",
+  "tags": ["scope:backend"]
+}

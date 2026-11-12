@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "libs/**/*.ts",
+    "apps/api-gateway/src/**/*.ts",
+    "apps/auth-service/src/**/*.ts",
+    "apps/catalog-service/src/**/*.ts",
+    "apps/order-service/src/**/*.ts",
+    "apps/payment-service/src/**/*.ts",
+    "apps/notification-service/src/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

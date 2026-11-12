@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../../node_modules/.prisma/order-client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("ORDER_DATABASE_URL")
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+}
+
+model Order {
+  id           String      @id @default(uuid()) @db.Uuid
+  userId       String      @db.Uuid
+  status       OrderStatus @default(PENDING)
+  totalAmount  Decimal     @db.Decimal(12, 2)
+  discountCode String?
+  createdAt    DateTime    @default(now())
+  items        OrderItem[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+model OrderItem {
+  id           String  @id @default(uuid()) @db.Uuid
+  orderId      String  @db.Uuid
+  order        Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId    String  @db.Uuid
+  productTitle String
+  quantity     Int
+  unitPrice    Decimal @db.Decimal(12, 2)
+
+  @@index([orderId])
+}
+
+model Outbox {
+  id          String    @id @default(uuid()) @db.Uuid
+  aggregateId String    @db.Uuid
+  eventType   String
+  payload     Json
+  traceId     String?
+  published   Boolean   @default(false)
+  attempts    Int       @default(0)
+  createdAt   DateTime  @default(now())
+  publishedAt DateTime?
+
+  @@index([published, createdAt])
+}

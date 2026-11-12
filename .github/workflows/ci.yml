@@ -1,0 +1,84 @@
+name: E-Commerce Monorepo CI Pipeline
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  # ============================================================================
+  # Stage 0: Secret Scanning (Gitleaks)
+  # ============================================================================
+  secret-scan:
+    name: "Stage 0: Gitleaks Secret Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (Full History for Gitleaks)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks Secret Scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  # ============================================================================
+  # Stage 1: Lint, Typecheck & Build (ESLint + tsc --noEmit + Vite Build)
+  # ============================================================================
+  lint-and-typecheck:
+    name: "Stage 1: Lint, Typecheck & Build"
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 (with npm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Generate Prisma Clients
+        run: npm run prisma:generate
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run TypeScript Typecheck (Backend & Shared Libs)
+        run: npm run typecheck
+
+      - name: Build Full Monorepo (Backend + Vue 3 SPA)
+        run: npm run build
+
+  # ============================================================================
+  # Stage 2: Unit & Supertest Integration Tests (Vitest >= 80% Coverage Gate)
+  # ============================================================================
+  tests-and-coverage:
+    name: "Stage 2: Vitest Unit & Integration Tests (>= 80% Gate)"
+    runs-on: ubuntu-latest
+    needs: lint-and-typecheck
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20 (with npm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Generate Prisma Clients
+        run: npm run prisma:generate
+
+      - name: Run Vitest with >= 80% Coverage Gate Enforcement
+        run: npm run test:coverage

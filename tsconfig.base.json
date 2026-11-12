@@ -1,0 +1,32 @@
+{
+  "compileOnSave": false,
+  "compilerOptions": {
+    "rootDir": ".",
+    "sourceMap": true,
+    "declaration": false,
+    "moduleResolution": "node",
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "importHelpers": true,
+    "target": "ES2022",
+    "module": "CommonJS",
+    "lib": ["ES2022", "DOM"],
+    "skipLibCheck": true,
+    "skipDefaultLibCheck": true,
+    "strict": true,
+    "strictPropertyInitialization": false,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "paths": {
+      "@shop/contracts": ["libs/contracts/src/index.ts"],
+      "@shop/rmq": ["libs/rmq/src/index.ts"],
+      "@shop/common": ["libs/common/src/index.ts"],
+      "@prisma/auth-client": ["node_modules/.prisma/auth-client"],
+      "@prisma/catalog-client": ["node_modules/.prisma/catalog-client"],
+      "@prisma/order-client": ["node_modules/.prisma/order-client"],
+      "@prisma/payment-client": ["node_modules/.prisma/payment-client"]
+    }
+  },
+  "exclude": ["node_modules", "tmp", "dist"]
+}
