@@ -7,7 +7,7 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --legacy-peer-deps
 
-COPY tsconfig.base.json tsconfig.json tsconfig.typecheck.json tsconfig.build.json nx.json ./
+COPY tsconfig.base.json tsconfig.json tsconfig.typecheck.json tsconfig.build.json nx.json vitest.config.ts ./
 COPY scripts ./scripts
 COPY libs ./libs
 COPY apps ./apps
