@@ -56,6 +56,15 @@ export class SecurityRedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async ping(): Promise<boolean> {
+    try {
+      const pong = await this.redis.ping();
+      return pong === 'PONG';
+    } catch {
+      return false;
+    }
+  }
+
   // ==========================================
   // 1. JWT Blacklisting (jwt_blacklist:<jti>)
   // ==========================================
@@ -94,16 +103,54 @@ export class SecurityRedisService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async lockIdempotencyKey(
+  /**
+   * Atomically acquires an in-flight idempotency lock using Redis `SET ... EX 60 NX`
+   * (eliminating the TOCTOU GET-then-SET race condition under concurrent identical requests).
+   */
+  async acquireIdempotencyLock(
     userId: string,
     idempotencyKey: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const key = `idempotency:${userId}:${idempotencyKey}`;
     const record: IdempotencyRecord = {
       status: 'PROCESSING',
       createdAt: new Date().toISOString(),
     };
-    await this.setWithTtl(key, JSON.stringify(record), 60);
+    const serialized = JSON.stringify(record);
+
+    try {
+      if (this.redis.status === 'ready') {
+        const result = await this.redis.set(key, serialized, 'EX', 60, 'NX');
+        if (result === 'OK') {
+          this.fallbackMemory.set(key, {
+            value: serialized,
+            expiresAt: Date.now() + 60 * 1000,
+          });
+          return true;
+        }
+        return false;
+      }
+    } catch {
+      // Fallback to in-process atomic Map check below
+    }
+
+    const now = Date.now();
+    const existing = this.fallbackMemory.get(key);
+    if (existing && existing.expiresAt >= now) {
+      return false;
+    }
+    this.fallbackMemory.set(key, {
+      value: serialized,
+      expiresAt: now + 60 * 1000,
+    });
+    return true;
+  }
+
+  async lockIdempotencyKey(
+    userId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    await this.acquireIdempotencyLock(userId, idempotencyKey);
   }
 
   async completeIdempotencyKey(

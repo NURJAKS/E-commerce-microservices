@@ -16,24 +16,38 @@ enum Role {
 model User {
   id            String         @id @default(uuid()) @db.Uuid
   email         String         @unique
-  passwordHash  String
+  passwordHash  String?
   role          Role           @default(CUSTOMER)
+  authProvider  String         @default("LOCAL")
+  googleId      String?
+  avatarUrl     String?
+  totpSecret    String?
+  totpEnabled   Boolean        @default(false)
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   refreshTokens RefreshToken[]
 
   @@index([email])
+  @@index([googleId])
 }
 
 model RefreshToken {
-  id        String   @id @default(uuid()) @db.Uuid
-  tokenHash String   @unique
-  userId    String   @db.Uuid
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  expiresAt DateTime
-  revoked   Boolean  @default(false)
-  createdAt DateTime @default(now())
+  id            String   @id @default(uuid()) @db.Uuid
+  tokenHash     String   @unique
+  familyId      String?  @db.Uuid
+  lastAccessJti String?
+  userId        String   @db.Uuid
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceName    String?
+  userAgent     String?
+  ipAddress     String?
+  expiresAt     DateTime
+  revoked       Boolean  @default(false)
+  lastUsedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
 
   @@index([userId])
   @@index([tokenHash])
+  @@index([familyId])
+  @@index([userId, revoked, expiresAt])
 }

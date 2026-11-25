@@ -1,4 +1,4 @@
-import { Controller, Get, Module } from '@nestjs/common';
+import { Controller, Get, Inject, Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule } from '@nestjs/jwt';
 import { ClientsModule, Transport } from '@nestjs/microservices';
@@ -9,7 +9,11 @@ import {
   TerminusModule,
 } from '@nestjs/terminus';
 import { ThrottlerModule } from '@nestjs/throttler';
-import { Public } from '@shop/common';
+import {
+  DependencyHealthIndicator,
+  Public,
+  resolveJwtAccessSecret,
+} from '@shop/common';
 import { SERVICES } from '@shop/contracts';
 import { AuthGatewayController } from './controllers/auth.controller';
 import { CatalogGatewayController } from './controllers/catalog.controller';
@@ -24,8 +28,14 @@ import { SecurityRedisService } from './security-redis.service';
 @Controller('health')
 export class HealthGatewayController {
   constructor(
+    @Inject(HealthCheckService)
     private readonly health: HealthCheckService,
+    @Inject(MemoryHealthIndicator)
     private readonly memory: MemoryHealthIndicator,
+    @Inject(DependencyHealthIndicator)
+    private readonly deps: DependencyHealthIndicator,
+    @Inject(SecurityRedisService)
+    private readonly securityRedis: SecurityRedisService,
   ) {}
 
   @Public()
@@ -34,6 +44,25 @@ export class HealthGatewayController {
   check() {
     return this.health.check([
       () => this.memory.checkHeap('memory_heap', 512 * 1024 * 1024),
+      () => this.deps.checkRedis('redis', () => this.securityRedis.ping()),
+    ]);
+  }
+
+  @Public()
+  @Get('live')
+  @HealthCheck()
+  liveness() {
+    return this.health.check([
+      () => this.memory.checkHeap('memory_heap', 512 * 1024 * 1024),
+    ]);
+  }
+
+  @Public()
+  @Get('ready')
+  @HealthCheck()
+  readiness() {
+    return this.health.check([
+      () => this.deps.checkRedis('redis', () => this.securityRedis.ping()),
     ]);
   }
 }
@@ -48,9 +77,7 @@ export class HealthGatewayController {
       },
     ]),
     JwtModule.register({
-      secret:
-        process.env.JWT_ACCESS_SECRET ||
-        'super-secret-jwt-access-key-shop-2026',
+      secret: resolveJwtAccessSecret('api-gateway'),
     }),
     ClientsModule.register([
       {
@@ -94,6 +121,7 @@ export class HealthGatewayController {
     OrderGatewayController,
   ],
   providers: [
+    DependencyHealthIndicator,
     MinioService,
     SecurityRedisService,
     IdempotencyInterceptor,

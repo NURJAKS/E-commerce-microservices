@@ -242,6 +242,55 @@ function handleWsOrderEvent(payload: OrderStatusUpdatedWsPayload) {
         );
       }, 600),
     );
+    return;
+  }
+
+  if (payload.status === 'REFUNDING') {
+    clearTimers();
+    overallState.value = 'PROCESSING';
+    nodeStates.value.gateway = 'success';
+    nodeStates.value.order = 'processing';
+    nodeStates.value.rabbitmq = 'processing';
+    nodeStates.value.payment = 'processing';
+    nodeStates.value.catalog = 'idle';
+
+    appendLog(
+      'OrderService',
+      `[REFUND SAGA] Order #${shortOrder} transitioned PAID -> REFUNDING + Outbox event order.refund_requested`,
+      'warn',
+      payload.updatedAt,
+    );
+    return;
+  }
+
+  if (payload.status === 'REFUNDED') {
+    clearTimers();
+    overallState.value = 'PAID';
+    activeTxId.value = payload.transactionId || 'ref_confirmed';
+    nodeStates.value.gateway = 'success';
+    nodeStates.value.rabbitmq = 'success';
+    nodeStates.value.payment = 'success';
+    nodeStates.value.catalog = 'compensated';
+    nodeStates.value.order = 'success';
+
+    appendLog(
+      'PaymentService',
+      `[REFUND SAGA] Idempotent refund completed (${activeTxId.value}) for Order #${shortOrder}. Published payment.refunded`,
+      'success',
+      payload.updatedAt,
+    );
+    appendLog(
+      'CatalogService',
+      `[REFUND SAGA] Consumed payment.refunded -> restored stock & recorded StockMovement(REFUND_RESTORE)`,
+      'success',
+      payload.updatedAt,
+    );
+    appendLog(
+      'OrderService',
+      `[REFUND SAGA] Order #${shortOrder} marked REFUNDED. Refund receipt email & WebSocket push sent!`,
+      'success',
+      payload.updatedAt,
+    );
   }
 }
 

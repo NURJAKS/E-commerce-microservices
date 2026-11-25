@@ -1,6 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { of } from 'rxjs';
+import { UserRole } from '@shop/contracts';
 import { OrderService } from './order.service';
 
 describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga Handlers', () => {
@@ -9,6 +15,7 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
   let mockCartService: any;
   let mockRmqService: any;
   let mockCatalogClient: any;
+  let mockInvoiceStorage: any;
 
   beforeEach(() => {
     mockPrisma = {
@@ -23,6 +30,9 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
         create: vi.fn(),
         findMany: vi.fn().mockResolvedValue([]),
         update: vi.fn(),
+      },
+      processedEvent: {
+        create: vi.fn().mockResolvedValue({}),
       },
     };
 
@@ -40,11 +50,24 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
       send: vi.fn(),
     };
 
+    mockInvoiceStorage = {
+      createPresignedDownloadUrl: vi.fn().mockResolvedValue({
+        downloadUrl:
+          'http://localhost:9000/invoices-private/invoices/invoice-ord-1.pdf?X-Amz-Expires=60&X-Amz-Signature=sig',
+        fileName: 'invoice-ord-1.pdf',
+        expiresInSeconds: 60,
+      }),
+      ensureFallbackInvoice: vi
+        .fn()
+        .mockResolvedValue('invoices/invoice-ord-1.pdf'),
+    };
+
     orderService = new OrderService(
       mockPrisma,
       mockCartService,
       mockRmqService,
       mockCatalogClient,
+      mockInvoiceStorage,
     );
   });
 
@@ -121,7 +144,17 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
 
       mockCatalogClient.send.mockImplementation((pattern: string) => {
         if (pattern === 'catalog.stock.check') {
-          return of({ available: true });
+          return of({
+            available: true,
+            quotedItems: [
+              {
+                productId: 'prod-1',
+                productTitle: 'Pro Keyboard',
+                unitPrice: 200,
+                quantity: 1,
+              },
+            ],
+          });
         }
         if (pattern === 'catalog.discounts.validate') {
           return of({
@@ -178,7 +211,7 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
 
       expect(order.status).toBe('PENDING');
       expect(order.totalAmount).toBe(160);
-      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+      expect(mockPrisma.$transaction).toHaveBeenCalledTimes(2);
       expect(mockPrisma.outbox.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
@@ -196,6 +229,7 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
           totalAmount: 160,
         }),
         'trace-123',
+        'outbox-uuid-1',
       );
       expect(mockPrisma.outbox.update).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -217,7 +251,19 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
         items: [{ productId: 'p1', productTitle: 'T', unitPrice: 100, quantity: 1 }],
       });
       mockCatalogClient.send.mockImplementation((pattern: string) => {
-        if (pattern === 'catalog.stock.check') return of({ available: true });
+        if (pattern === 'catalog.stock.check') {
+          return of({
+            available: true,
+            quotedItems: [
+              {
+                productId: 'p1',
+                productTitle: 'T',
+                unitPrice: 100,
+                quantity: 1,
+              },
+            ],
+          });
+        }
         return of({ valid: false, reason: 'Expired promo' });
       });
 
@@ -225,12 +271,94 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
         orderService.checkout('u1', 'a@b.c', 'EXPIRED'),
       ).rejects.toThrow(BadRequestException);
     });
+
+    it('prevents client-side price tampering by pricing orders strictly from authoritative catalog-service quotes', async () => {
+      // Attacker submits tampered $0.01 unitPrice in cart
+      mockCartService.getCart.mockResolvedValue({
+        userId: 'attacker-1',
+        subtotal: 0.01,
+        items: [
+          {
+            productId: 'prod-macbook',
+            productTitle: 'Tampered Title',
+            unitPrice: 0.01,
+            quantity: 2,
+          },
+        ],
+      });
+
+      // Authoritative catalog_db price is $1999.00 each
+      mockCatalogClient.send.mockImplementation((pattern: string) => {
+        if (pattern === 'catalog.stock.check') {
+          return of({
+            available: true,
+            quotedItems: [
+              {
+                productId: 'prod-macbook',
+                productTitle: 'MacBook Pro 16',
+                unitPrice: 1999,
+                quantity: 2,
+              },
+            ],
+          });
+        }
+        return of({});
+      });
+
+      mockPrisma.order.create.mockImplementation(({ data }: any) =>
+        Promise.resolve({
+          id: 'order-secure-1',
+          userId: data.userId,
+          status: data.status,
+          totalAmount: data.totalAmount,
+          discountCode: data.discountCode,
+          createdAt: new Date(),
+          items: data.items.create.map((i: any, idx: number) => ({
+            id: `item-${idx}`,
+            orderId: 'order-secure-1',
+            ...i,
+          })),
+        }),
+      );
+
+      const order = await orderService.checkout('attacker-1', 'a@evil.test');
+      expect(order.totalAmount).toBe(3998);
+      expect(order.items[0].unitPrice).toBe(1999);
+      expect(order.items[0].productTitle).toBe('MacBook Pro 16');
+    });
+
+    it('uses PostgreSQL FOR UPDATE SKIP LOCKED when $queryRaw is available for safe multi-replica Outbox polling', async () => {
+      mockPrisma.$queryRaw = vi.fn().mockResolvedValue([
+        {
+          id: 'outbox-locked-1',
+          eventType: 'order.created',
+          payload: { orderId: 'ord-locked-1' },
+          traceId: 'trace-locked',
+        },
+      ]);
+
+      const count = await orderService.processOutboxBatch();
+      expect(count).toBe(1);
+      expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1);
+      expect(mockRmqService.publish).toHaveBeenCalledWith(
+        'order.created',
+        { orderId: 'ord-locked-1' },
+        'trace-locked',
+        'outbox-locked-1',
+      );
+      expect(mockPrisma.outbox.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'outbox-locked-1' },
+          data: expect.objectContaining({ published: true }),
+        }),
+      );
+    });
   });
 
   describe('Saga Event Handlers & Order Queries', () => {
     it('transitions order status on payment.succeeded, payment.failed, and catalog.stock.failed', async () => {
       await orderService.onModuleInit();
-      expect(mockRmqService.subscribe).toHaveBeenCalledTimes(3);
+      expect(mockRmqService.subscribe).toHaveBeenCalledTimes(5);
 
       await orderService.handlePaymentSucceeded({
         paymentId: 'pay-1',
@@ -271,6 +399,54 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
       });
     });
 
+    it('enforces Inbox Pattern deduplication when RabbitMQ redelivers an already-processed event (P2002)', async () => {
+      const p2002 = Object.assign(new Error('Unique constraint failed'), {
+        code: 'P2002',
+      });
+      mockPrisma.processedEvent.create.mockRejectedValue(p2002);
+
+      await orderService.handlePaymentSucceeded(
+        {
+          paymentId: 'pay-dup',
+          orderId: 'ord-dup',
+          userId: 'u-1',
+          amount: 100,
+          transactionId: 'tx_dup',
+          paidAt: new Date().toISOString(),
+        },
+        'trace-dup',
+        'evt-dup-1',
+      );
+
+      await orderService.handlePaymentFailed(
+        {
+          paymentId: 'pay-dup-2',
+          orderId: 'ord-dup-2',
+          userId: 'u-1',
+          items: [],
+          amount: 100,
+          reason: 'Declined',
+          failedAt: new Date().toISOString(),
+        },
+        'trace-dup',
+        'evt-dup-2',
+      );
+
+      await orderService.handleStockFailed(
+        {
+          orderId: 'ord-dup-3',
+          userId: 'u-1',
+          reason: 'Out of stock',
+          failedAt: new Date().toISOString(),
+        },
+        'trace-dup',
+        'evt-dup-3',
+      );
+
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+      expect(mockRmqService.publish).not.toHaveBeenCalled();
+    });
+
     it('fetches user orders and single order by ID', async () => {
       const sampleOrder = {
         id: 'ord-10',
@@ -294,6 +470,205 @@ describe('OrderService — Promo Code Calculation, Transactional Outbox & Saga H
       await expect(
         orderService.getOrderById('missing', 'u-1'),
       ).rejects.toThrow(NotFoundException);
+    });
+
+    it('initiates Refund Saga (PAID -> REFUNDING + Outbox) and transitions to REFUNDED on payment.refunded with Inbox deduplication', async () => {
+      const paidOrder = {
+        id: 'ord-refund-1',
+        userId: 'u-1',
+        status: 'PAID',
+        totalAmount: 199.99,
+        discountCode: null,
+        createdAt: new Date(),
+        items: [
+          {
+            id: 'item-1',
+            orderId: 'ord-refund-1',
+            productId: 'prod-1',
+            productTitle: 'Keyboard',
+            quantity: 1,
+            unitPrice: 199.99,
+          },
+        ],
+      };
+
+      mockPrisma.order.findUnique.mockResolvedValue(paidOrder);
+      mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
+      mockPrisma.outbox.findMany.mockResolvedValue([
+        {
+          id: 'outbox-refund-1',
+          aggregateId: 'ord-refund-1',
+          eventType: 'order.refund_requested',
+          payload: { orderId: 'ord-refund-1', amount: 199.99 },
+          traceId: 'trace-refund',
+          published: false,
+        },
+      ]);
+
+      const refunding = await orderService.requestRefund(
+        'ord-refund-1',
+        'u-1',
+        UserRole.CUSTOMER,
+        'u1@shop.local',
+        'Changed mind',
+        'trace-refund',
+      );
+
+      expect(refunding.status).toBe('REFUNDING');
+      expect(mockPrisma.outbox.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            aggregateId: 'ord-refund-1',
+            eventType: 'order.refund_requested',
+            published: false,
+          }),
+        }),
+      );
+      expect(mockRmqService.publish).toHaveBeenCalledWith(
+        'order.refund_requested',
+        expect.objectContaining({ orderId: 'ord-refund-1' }),
+        'trace-refund',
+        'outbox-refund-1',
+      );
+
+      // Rejects unauthorized non-owner CUSTOMER
+      await expect(
+        orderService.requestRefund('ord-refund-1', 'other-user', UserRole.CUSTOMER),
+      ).rejects.toThrow(ForbiddenException);
+
+      // Rejects already REFUNDING / REFUNDED
+      mockPrisma.order.findUnique.mockResolvedValue({
+        ...paidOrder,
+        status: 'REFUNDING',
+      });
+      await expect(
+        orderService.requestRefund('ord-refund-1', 'u-1', UserRole.CUSTOMER),
+      ).rejects.toThrow(ConflictException);
+
+      // Rejects non-PAID status (e.g. PENDING)
+      mockPrisma.order.findUnique.mockResolvedValue({
+        ...paidOrder,
+        status: 'PENDING',
+      });
+      await expect(
+        orderService.requestRefund('ord-refund-1', 'u-1', UserRole.CUSTOMER),
+      ).rejects.toThrow(BadRequestException);
+
+      // Transitions to REFUNDED on payment.refunded
+      mockPrisma.order.updateMany.mockClear();
+      await orderService.handlePaymentRefunded(
+        {
+          paymentId: 'pay-1',
+          orderId: 'ord-refund-1',
+          userId: 'u-1',
+          items: [],
+          amount: 199.99,
+          refundTransactionId: 'ref_abc123',
+          reason: 'Changed mind',
+          refundedAt: new Date().toISOString(),
+        },
+        'trace-refund',
+        'evt-refund-1',
+      );
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: 'ord-refund-1' },
+        data: { status: 'REFUNDED' },
+      });
+
+      // Deduplicates duplicate payment.refunded via Inbox P2002
+      mockPrisma.order.updateMany.mockClear();
+      mockPrisma.processedEvent.create.mockRejectedValueOnce(
+        Object.assign(new Error('Duplicate'), { code: 'P2002' }),
+      );
+      await orderService.handlePaymentRefunded(
+        {
+          paymentId: 'pay-1',
+          orderId: 'ord-refund-1',
+          userId: 'u-1',
+          items: [],
+          amount: 199.99,
+          refundTransactionId: 'ref_abc123',
+          reason: 'Changed mind',
+          refundedAt: new Date().toISOString(),
+        },
+        'trace-refund',
+        'evt-refund-1',
+      );
+      expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('enforces IDOR protection on getInvoiceDownloadUrl and issues 60s Presigned GET URL for paid orders', async () => {
+      const paidOrder = {
+        id: 'ord-inv-1',
+        userId: 'owner-1',
+        status: 'PAID',
+        totalAmount: 149.99,
+        invoiceKey: 'invoices/invoice-ord-inv-1.pdf',
+        createdAt: new Date(),
+        items: [],
+      };
+
+      mockPrisma.order.findUnique.mockResolvedValue(paidOrder);
+
+      // IDOR check: different CUSTOMER user is rejected with 403 Forbidden
+      await expect(
+        orderService.getInvoiceDownloadUrl(
+          'ord-inv-1',
+          'attacker-2',
+          UserRole.CUSTOMER,
+        ),
+      ).rejects.toThrow(ForbiddenException);
+
+      // Owner receives 60s Presigned GET URL
+      const res = await orderService.getInvoiceDownloadUrl(
+        'ord-inv-1',
+        'owner-1',
+        UserRole.CUSTOMER,
+      );
+      expect(res.expiresInSeconds).toBe(60);
+      expect(res.downloadUrl).toContain('X-Amz-Expires=60');
+
+      // Pending order rejected with 400 BadRequest
+      mockPrisma.order.findUnique.mockResolvedValueOnce({
+        ...paidOrder,
+        status: 'PENDING',
+      });
+      await expect(
+        orderService.getInvoiceDownloadUrl(
+          'ord-inv-1',
+          'owner-1',
+          UserRole.CUSTOMER,
+        ),
+      ).rejects.toThrow(BadRequestException);
+
+      // Fallback generation when invoiceKey is null
+      mockPrisma.order.findUnique.mockResolvedValueOnce({
+        ...paidOrder,
+        invoiceKey: null,
+      });
+      await orderService.getInvoiceDownloadUrl(
+        'ord-inv-1',
+        'admin-99',
+        UserRole.ADMIN,
+      );
+      expect(mockInvoiceStorage.ensureFallbackInvoice).toHaveBeenCalledTimes(1);
+
+      // Inbox-protected invoice.generated event updates invoiceKey
+      mockPrisma.order.updateMany.mockClear();
+      await orderService.handleInvoiceGenerated(
+        {
+          orderId: 'ord-inv-1',
+          userId: 'owner-1',
+          invoiceKey: 'invoices/invoice-ord-inv-1.pdf',
+          generatedAt: new Date().toISOString(),
+        },
+        'trace-inv',
+        'evt-inv-1',
+      );
+      expect(mockPrisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: 'ord-inv-1' },
+        data: { invoiceKey: 'invoices/invoice-ord-inv-1.pdf' },
+      });
     });
   });
 });

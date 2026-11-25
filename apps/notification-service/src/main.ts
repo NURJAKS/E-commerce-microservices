@@ -8,6 +8,7 @@ async function bootstrap() {
   const port = Number(process.env.NOTIFICATION_SERVICE_PORT || 3005);
 
   const app = await NestFactory.create(NotificationModule, { cors: true });
+  app.enableShutdownHooks();
   await app.listen(port, '0.0.0.0');
   logger.log(
     `Notification Service & WebSocket Gateway listening on port ${port}`,

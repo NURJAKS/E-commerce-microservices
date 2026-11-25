@@ -1,6 +1,11 @@
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
-import type { AuthTokensResponse, UserDto } from '@shop/contracts';
+import type {
+  AuthTokensResponse,
+  SessionDto,
+  TotpSetupResponse,
+  UserDto,
+} from '@shop/contracts';
 import { configureHttpAuthCallbacks, http } from '../api/http';
 import { socketManager } from '../services/socket';
 
@@ -60,18 +65,57 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
-  async function login(email: string, password: string) {
+  async function login(email: string, password: string, totpCode?: string) {
     loading.value = true;
     try {
       const { data } = await http.post<AuthTokensResponse>('/auth/login', {
         email,
         password,
+        ...(totpCode ? { totpCode } : {}),
       });
       setAuthSession(data);
       return data;
     } finally {
       loading.value = false;
     }
+  }
+
+  async function fetchMe(): Promise<UserDto> {
+    const { data } = await http.get<UserDto>('/auth/me');
+    user.value = data;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data));
+    }
+    return data;
+  }
+
+  async function fetchSessions(): Promise<SessionDto[]> {
+    const { data } = await http.get<SessionDto[]>('/auth/sessions');
+    return data;
+  }
+
+  async function revokeSession(sessionId: string): Promise<void> {
+    await http.delete(`/auth/sessions/${sessionId}`);
+  }
+
+  async function revokeAllSessions(): Promise<void> {
+    await http.post('/auth/sessions/revoke-all', {});
+    clearSession();
+  }
+
+  async function setupTwoFactor(): Promise<TotpSetupResponse> {
+    const { data } = await http.post<TotpSetupResponse>('/auth/2fa/setup', {});
+    return data;
+  }
+
+  async function enableTwoFactor(code: string): Promise<void> {
+    await http.post('/auth/2fa/enable', { code });
+    await fetchMe();
+  }
+
+  async function disableTwoFactor(code: string): Promise<void> {
+    await http.post('/auth/2fa/disable', { code });
+    await fetchMe();
   }
 
   async function refreshToken(): Promise<string | null> {
@@ -115,6 +159,13 @@ export const useAuthStore = defineStore('auth', () => {
     isAdmin,
     register,
     login,
+    fetchMe,
+    fetchSessions,
+    revokeSession,
+    revokeAllSessions,
+    setupTwoFactor,
+    enableTwoFactor,
+    disableTwoFactor,
     refreshToken,
     logout,
     restoreSessionIfAvailable,

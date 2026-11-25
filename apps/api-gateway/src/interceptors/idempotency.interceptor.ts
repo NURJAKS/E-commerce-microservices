@@ -35,30 +35,34 @@ export class IdempotencyInterceptor implements NestInterceptor {
     }
 
     const userId = request.user?.userId || request.ip || 'anonymous';
-    const existing = await this.securityRedis.getIdempotencyRecord(
+    // Atomic SET NX EX eliminates TOCTOU races between concurrent retries with the same X-Idempotency-Key
+    const acquired = await this.securityRedis.acquireIdempotencyLock(
       userId,
       idempotencyKey,
     );
 
-    if (existing) {
-      // Block concurrent in-flight retries before the first transaction finishes
-      if (existing.status === 'PROCESSING') {
-        throw new ConflictException(
-          'A request with this X-Idempotency-Key is currently being processed',
-        );
-      }
+    if (!acquired) {
+      const existing = await this.securityRedis.getIdempotencyRecord(
+        userId,
+        idempotencyKey,
+      );
 
       // Replay cached response for 24h to guarantee idempotency across network retries / double-clicks
-      this.logger.log(
-        `[Idempotency] Replaying cached response for user=${userId} key=${idempotencyKey}`,
-      );
-      if (response && typeof response.setHeader === 'function') {
-        response.setHeader('X-Idempotency-Replayed', 'true');
+      if (existing && existing.status === 'COMPLETED') {
+        this.logger.log(
+          `[Idempotency] Replaying cached response for user=${userId} key=${idempotencyKey}`,
+        );
+        if (response && typeof response.setHeader === 'function') {
+          response.setHeader('X-Idempotency-Replayed', 'true');
+        }
+        return of(existing.response);
       }
-      return of(existing.response);
-    }
 
-    await this.securityRedis.lockIdempotencyKey(userId, idempotencyKey);
+      // Block concurrent in-flight retries before the first transaction finishes
+      throw new ConflictException(
+        'A request with this X-Idempotency-Key is currently being processed',
+      );
+    }
 
     return next.handle().pipe(
       tap(async (data) => {

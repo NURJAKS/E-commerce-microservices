@@ -46,6 +46,15 @@ export class CartService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  async pingRedis(): Promise<boolean> {
+    try {
+      const pong = await this.redis.ping();
+      return pong === 'PONG';
+    } catch {
+      return false;
+    }
+  }
+
   getCartKey(userId: string): string {
     return `cart:${userId}`;
   }

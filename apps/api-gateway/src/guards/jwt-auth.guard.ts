@@ -35,6 +35,29 @@ export class JwtAuthGuard implements CanActivate {
     ]);
 
     if (isPublic) {
+      const optionalAuth: string | undefined = request.headers['authorization'];
+      if (optionalAuth && optionalAuth.startsWith('Bearer ')) {
+        try {
+          const payload = await this.jwtService.verifyAsync<JwtPayload>(
+            optionalAuth.slice(7).trim(),
+          );
+          if (
+            !payload.jti ||
+            !(await this.securityRedis.isAccessTokenBlacklisted(payload.jti))
+          ) {
+            request.user = {
+              userId: payload.sub,
+              email: payload.email,
+              role: payload.role,
+              jti: payload.jti,
+              exp: payload.exp,
+              traceId: request.headers['x-trace-id'],
+            } as CurrentUserPayload;
+          }
+        } catch {
+          // Ignore invalid token on public endpoints
+        }
+      }
       return true;
     }
 

@@ -1,0 +1,130 @@
+name: Continuous Deployment (CD)
+
+on:
+  workflow_run:
+    workflows: ["E-Commerce Monorepo CI/CD Pipeline"]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      image_tag:
+        description: 'GHCR image tag to deploy (e.g. latest or sha-abc1234)'
+        required: true
+        default: 'latest'
+        type: string
+
+concurrency:
+  group: cd-deploy-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "Deploy ${{ github.event.inputs.environment || 'staging' }} (${{ github.event.inputs.image_tag || 'latest' }})"
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check deployment target secrets
+        id: check_secrets
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$DEPLOY_SSH_KEY" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Deployment secrets (DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY) are not configured yet."
+            echo "Set them in GitHub Repository -> Settings -> Environments -> staging/production to enable live SSH deployment."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync production Compose & Nginx config to target host
+        if: steps.check_secrets.outputs.configured == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/novashop' }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+          ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p $DEPLOY_PATH/nginx $DEPLOY_PATH/docker/postgres"
+
+          scp -i ~/.ssh/id_deploy -P "$DEPLOY_PORT" \
+            docker-compose.prod.yml \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/docker-compose.prod.yml"
+
+          scp -i ~/.ssh/id_deploy -P "$DEPLOY_PORT" \
+            nginx/default.conf \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/nginx/default.conf"
+
+          scp -i ~/.ssh/id_deploy -P "$DEPLOY_PORT" \
+            docker/postgres/init-multi-db.sql \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/docker/postgres/init-multi-db.sql"
+
+      - name: Pull immutable GHCR images, deploy, and run health smoke tests
+        if: steps.check_secrets.outputs.configured == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/novashop' }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_ACTOR: ${{ github.actor }}
+          GHCR_PREFIX: ghcr.io/${{ github.repository }}
+          INPUT_IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          LOWER_PREFIX=$(echo "$GHCR_PREFIX" | tr '[:upper:]' '[:lower:]')
+          SHORT_SHA=$(echo "$WORKFLOW_HEAD_SHA" | cut -c1-7)
+          RESOLVED_TAG="${INPUT_IMAGE_TAG:-sha-$SHORT_SHA}"
+          ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" bash -s <<EOF
+            set -euo pipefail
+            cd "$DEPLOY_PATH"
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+
+            export GHCR_PREFIX="$LOWER_PREFIX"
+            export IMAGE_TAG="$RESOLVED_TAG"
+
+            echo "Pulling immutable images ($LOWER_PREFIX-*:$RESOLVED_TAG)..."
+            docker compose -f docker-compose.prod.yml pull
+
+            echo "Rolling out containers with graceful shutdown..."
+            docker compose -f docker-compose.prod.yml up -d --remove-orphans
+
+            echo "Running post-deploy readiness smoke test..."
+            for i in \$(seq 1 20); do
+              if curl -fsS http://127.0.0.1:3000/api/health/ready > /dev/null; then
+                echo "✅ API Gateway readiness probe PASSED!"
+                docker image prune -f --filter "until=72h" || true
+                exit 0
+              fi
+              echo "Waiting for /api/health/ready (\$i/20)..."
+              sleep 3
+            done
+
+            echo "❌ Post-deploy readiness probe FAILED!"
+            docker compose -f docker-compose.prod.yml ps
+            exit 1
+          EOF

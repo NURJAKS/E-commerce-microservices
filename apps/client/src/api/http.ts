@@ -20,11 +20,31 @@ export const http = axios.create({
   withCredentials: true,
 });
 
-// Request Interceptor: automatically attach Bearer token from in-memory store
+function getOrCreateViewerId(): string {
+  if (typeof window === 'undefined') return '';
+  const storageKey = 'novashop_viewer_id';
+  let id = window.localStorage.getItem(storageKey);
+  if (!id) {
+    id =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `viewer-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    window.localStorage.setItem(storageKey, id);
+  }
+  return id;
+}
+
+// Request Interceptor: automatically attach Bearer token & anonymous X-Viewer-Id
 http.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const token = accessTokenGetter();
-  if (token && config.headers) {
-    config.headers.Authorization = `Bearer ${token}`;
+  if (config.headers) {
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    const viewerId = getOrCreateViewerId();
+    if (viewerId) {
+      config.headers['X-Viewer-Id'] = viewerId;
+    }
   }
   return config;
 });

@@ -38,6 +38,23 @@ async function handleRegister() {
         </p>
       </div>
 
+      <a
+        href="/api/auth/google"
+        data-testid="google-oauth-register-btn"
+        class="flex w-full items-center justify-center gap-2.5 rounded-xl border border-slate-700 bg-slate-950 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 transition"
+      >
+        <span class="text-base font-black text-indigo-400">G</span>
+        <span>Sign up with Google (OAuth 2.0)</span>
+      </a>
+
+      <div class="relative flex items-center">
+        <div class="flex-grow border-t border-slate-800"></div>
+        <span class="mx-3 text-[11px] uppercase tracking-wider text-slate-500"
+          >or with email</span
+        >
+        <div class="flex-grow border-t border-slate-800"></div>
+      </div>
+
       <form @submit.prevent="handleRegister" class="space-y-4">
         <div>
           <label class="block text-xs font-medium text-slate-300 mb-1"

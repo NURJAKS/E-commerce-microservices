@@ -6,7 +6,12 @@ import {
   MemoryHealthIndicator,
   TerminusModule,
 } from '@nestjs/terminus';
-import { RabbitMQModule } from '@shop/rmq';
+import {
+  DependencyHealthIndicator,
+  resolveJwtAccessSecret,
+} from '@shop/common';
+import { RabbitMQModule, RabbitMQService } from '@shop/rmq';
+import { InvoicePdfService } from './invoice-pdf.service';
 import { NotificationGateway } from './notification.gateway';
 import { NotificationService } from './notification.service';
 
@@ -15,6 +20,8 @@ export class HealthController {
   constructor(
     private readonly health: HealthCheckService,
     private readonly memory: MemoryHealthIndicator,
+    private readonly deps: DependencyHealthIndicator,
+    private readonly rmq: RabbitMQService,
   ) {}
 
   @Get()
@@ -22,6 +29,23 @@ export class HealthController {
   check() {
     return this.health.check([
       () => this.memory.checkHeap('memory_heap', 512 * 1024 * 1024),
+      () => this.deps.checkRabbitMQ('rabbitmq', this.rmq),
+    ]);
+  }
+
+  @Get('live')
+  @HealthCheck()
+  liveness() {
+    return this.health.check([
+      () => this.memory.checkHeap('memory_heap', 512 * 1024 * 1024),
+    ]);
+  }
+
+  @Get('ready')
+  @HealthCheck()
+  readiness() {
+    return this.health.check([
+      () => this.deps.checkRabbitMQ('rabbitmq', this.rmq),
     ]);
   }
 }
@@ -30,15 +54,18 @@ export class HealthController {
   imports: [
     TerminusModule,
     JwtModule.register({
-      secret:
-        process.env.JWT_ACCESS_SECRET ||
-        'super-secret-jwt-access-key-shop-2026',
+      secret: resolveJwtAccessSecret('notification-service'),
     }),
     RabbitMQModule.forRoot({
       serviceName: 'notification-service',
     }),
   ],
   controllers: [HealthController],
-  providers: [NotificationGateway, NotificationService],
+  providers: [
+    DependencyHealthIndicator,
+    InvoicePdfService,
+    NotificationGateway,
+    NotificationService,
+  ],
 })
 export class NotificationModule {}

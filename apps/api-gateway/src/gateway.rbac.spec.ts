@@ -3,21 +3,24 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { JwtModule, JwtService } from '@nestjs/jwt';
+import { TerminusModule } from '@nestjs/terminus';
 import { Test } from '@nestjs/testing';
 import cookieParser from 'cookie-parser';
-import { of } from 'rxjs';
+import { of, throwError } from 'rxjs';
 import request from 'supertest';
-import { HttpExceptionFilter } from '@shop/common';
+import { DependencyHealthIndicator, HttpExceptionFilter } from '@shop/common';
 import {
   AUTH_PATTERNS,
   CATALOG_PATTERNS,
   ORDER_PATTERNS,
+  PAYMENT_PATTERNS,
   SERVICES,
   UserRole,
 } from '@shop/contracts';
 import { AuthGatewayController } from './controllers/auth.controller';
 import { CatalogGatewayController } from './controllers/catalog.controller';
 import { OrderGatewayController } from './controllers/order.controller';
+import { HealthGatewayController } from './gateway.module';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { WafThrottlerGuard } from './guards/waf-throttler.guard';
@@ -44,26 +47,42 @@ describe('API Gateway Integration Tests (Supertest: RBAC, HttpOnly Cookie, JWT B
 
     const moduleRef = await Test.createTestingModule({
       imports: [
+        TerminusModule,
         JwtModule.register({
           secret: 'test-gateway-jwt-secret',
           signOptions: { expiresIn: '15m' },
         }),
       ],
       controllers: [
+        HealthGatewayController,
         AuthGatewayController,
         CatalogGatewayController,
         OrderGatewayController,
       ],
       providers: [
+        DependencyHealthIndicator,
         {
           provide: GATEWAY_REDIS_CLIENT,
-          useValue: { status: 'end', quit: vi.fn() },
+          useValue: {
+            status: 'end',
+            ping: vi.fn().mockResolvedValue('PONG'),
+            quit: vi.fn(),
+          },
         },
         SecurityRedisService,
         IdempotencyInterceptor,
         {
           provide: MinioService,
-          useValue: { uploadProductImage: vi.fn() },
+          useValue: {
+            uploadProductImage: vi.fn(),
+            createPresignedUploadUrl: vi.fn().mockResolvedValue({
+              uploadUrl: 'http://localhost:9000/products-media/products/test.webp?X-Amz-Signature=abc',
+              key: 'products/test.webp',
+              publicUrl: 'http://localhost:9000/products-media/products/test.webp',
+              expiresInSeconds: 60,
+              requiredHeaders: { 'Content-Type': 'image/webp' },
+            }),
+          },
         },
         { provide: SERVICES.AUTH, useValue: mockAuthClient },
         { provide: SERVICES.CATALOG, useValue: mockCatalogClient },
@@ -75,7 +94,8 @@ describe('API Gateway Integration Tests (Supertest: RBAC, HttpOnly Cookie, JWT B
       ],
     }).compile();
 
-    app = moduleRef.createNestApplication();
+    app = moduleRef.createNestApplication({ rawBody: true });
+    (app as any).set('trust proxy', 1);
     app.setGlobalPrefix('api');
     app.use(cookieParser());
     app.useGlobalPipes(
@@ -279,9 +299,153 @@ describe('API Gateway Integration Tests (Supertest: RBAC, HttpOnly Cookie, JWT B
 
     const sixthAttempt = await request(app.getHttpServer())
       .post('/api/auth/login')
-      .set('X-Forwarded-For', testIp)
+      .set('X-Forwarded-For', `198.51.100.99, ${testIp}`)
       .send({ email: 'a@b.c', password: 'password123' });
 
+    // Even with a spoofed leading X-Forwarded-For IP, trust proxy=1 resolves the proxy-appended IP and enforces 429
     expect(sixthAttempt.status).toBe(429);
+  });
+
+  it('exposes public /api/health/live and /api/health/ready endpoints verifying Redis connectivity', async () => {
+    const liveRes = await request(app.getHttpServer()).get('/api/health/live');
+    expect(liveRes.status).toBe(200);
+    expect(liveRes.body.status).toBe('ok');
+
+    const readyRes = await request(app.getHttpServer()).get('/api/health/ready');
+    expect(readyRes.status).toBe(200);
+    expect(readyRes.body.status).toBe('ok');
+    expect(readyRes.body.info.redis.status).toBe('up');
+  });
+
+  it('restricts POST /api/catalog/upload/presign to ADMIN and issues a 60s Presigned PUT URL', async () => {
+    const customerToken = await jwtService.signAsync({
+      sub: 'cust-presign',
+      email: 'cust@shop.local',
+      role: UserRole.CUSTOMER,
+      jti: 'jti-cust-presign',
+    });
+    const adminToken = await jwtService.signAsync({
+      sub: 'admin-presign',
+      email: 'admin@shop.local',
+      role: UserRole.ADMIN,
+      jti: 'jti-admin-presign',
+    });
+
+    const forbidden = await request(app.getHttpServer())
+      .post('/api/catalog/upload/presign')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .send({ fileName: 'a.webp', contentType: 'image/webp', sizeBytes: 5000 });
+    expect(forbidden.status).toBe(403);
+
+    const allowed = await request(app.getHttpServer())
+      .post('/api/catalog/upload/presign')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ fileName: 'a.webp', contentType: 'image/webp', sizeBytes: 5000 });
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.expiresInSeconds).toBe(60);
+    expect(allowed.body.key).toBe('products/test.webp');
+  });
+
+  it('forwards exact raw body & Stripe-Signature to payment-service on public POST /api/payments/webhook/stripe', async () => {
+    const missingSig = await request(app.getHttpServer())
+      .post('/api/payments/webhook/stripe')
+      .send({ id: 'evt_no_sig' });
+    expect(missingSig.status).toBe(400);
+
+    mockPaymentClient.send.mockReturnValueOnce(
+      of({ received: true, deduplicated: false, eventId: 'evt_gw_1' }),
+    );
+
+    const rawPayload = '{"id":"evt_gw_1","type":"checkout.session.completed"}';
+    const res = await request(app.getHttpServer())
+      .post('/api/payments/webhook/stripe')
+      .set('Content-Type', 'application/json')
+      .set('Stripe-Signature', 't=1700000000,v1=test_sig')
+      .send(rawPayload);
+
+    expect(res.status).toBe(201);
+    expect(res.body.received).toBe(true);
+    expect(mockPaymentClient.send).toHaveBeenCalledWith(
+      PAYMENT_PATTERNS.HANDLE_STRIPE_WEBHOOK,
+      expect.objectContaining({
+        rawBody: rawPayload,
+        signature: 't=1700000000,v1=test_sig',
+      }),
+    );
+  });
+
+  it('blacklists revoked session-family JTIs in Redis when Refresh Token Reuse Detection triggers and redirects Google OAuth with CSRF state cookie', async () => {
+    const activeToken = await jwtService.signAsync({
+      sub: 'victim-1',
+      email: 'victim@shop.local',
+      role: UserRole.CUSTOMER,
+      jti: 'jti-stolen-family-1',
+    });
+
+    mockAuthClient.send.mockImplementation((pattern: string) => {
+      if (pattern === AUTH_PATTERNS.REFRESH) {
+        return throwError(() => ({
+          statusCode: 401,
+          message: 'Refresh token reuse detected — session family revoked',
+          reuseDetected: true,
+          revokedJtis: ['jti-stolen-family-1'],
+        }));
+      }
+      return of({});
+    });
+
+    const reuseRes = await request(app.getHttpServer())
+      .post('/api/auth/refresh')
+      .send({ refreshToken: 'replayed-refresh-token' });
+    expect(reuseRes.status).toBe(401);
+
+    // The active JWT belonging to the compromised family is now immediately blacklisted in Redis
+    const blockedMe = await request(app.getHttpServer())
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${activeToken}`);
+    expect(blockedMe.status).toBe(401);
+    expect(blockedMe.body.message).toContain('revoked');
+
+    // Google OAuth 2.0 initiation sets CSRF state cookie & redirects to accounts.google.com
+    process.env.GOOGLE_CLIENT_ID = 'test-google-client-id';
+    process.env.GOOGLE_CLIENT_SECRET = 'test-google-secret';
+    const oauthRes = await request(app.getHttpServer()).get('/api/auth/google');
+    expect(oauthRes.status).toBe(302);
+    expect(oauthRes.headers.location).toContain(
+      'https://accounts.google.com/o/oauth2/v2/auth',
+    );
+    expect(oauthRes.headers['set-cookie']?.[0]).toContain('oauth_state=');
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GOOGLE_CLIENT_SECRET;
+  });
+
+  it('rejects concurrent in-flight duplicate X-Idempotency-Key with 409 Conflict via atomic lock', async () => {
+    const customerToken = await jwtService.signAsync({
+      sub: 'cust-race-1',
+      email: 'race@shop.local',
+      role: UserRole.CUSTOMER,
+      jti: 'jti-race-1',
+    });
+
+    const securityRedis = app.get(SecurityRedisService);
+    const raceKey = 'race-lock-key-001';
+    const firstAcquired = await securityRedis.acquireIdempotencyLock(
+      'cust-race-1',
+      raceKey,
+    );
+    const secondAcquired = await securityRedis.acquireIdempotencyLock(
+      'cust-race-1',
+      raceKey,
+    );
+    expect(firstAcquired).toBe(true);
+    expect(secondAcquired).toBe(false);
+
+    const conflictRes = await request(app.getHttpServer())
+      .post('/api/orders/checkout')
+      .set('Authorization', `Bearer ${customerToken}`)
+      .set('X-Idempotency-Key', raceKey)
+      .send({});
+    expect(conflictRes.status).toBe(409);
+    expect(mockOrderClient.send).not.toHaveBeenCalled();
   });
 });

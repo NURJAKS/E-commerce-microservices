@@ -14,6 +14,11 @@ import {
   SetMetadata,
 } from '@nestjs/common';
 import { RpcException } from '@nestjs/microservices';
+import {
+  HealthCheckError,
+  HealthIndicator,
+  HealthIndicatorResult,
+} from '@nestjs/terminus';
 import * as crypto from 'crypto';
 import { Observable, tap, throwError } from 'rxjs';
 import { CurrentUserPayload, UserRole } from '@shop/contracts';
@@ -121,6 +126,12 @@ export class AllRpcExceptionFilter implements RpcExceptionFilter<any> {
       return throwError(() => ({
         statusCode: status,
         message,
+        ...(typeof res === 'object' && res?.reuseDetected
+          ? {
+              reuseDetected: res.reuseDetected,
+              revokedJtis: res.revokedJtis || [],
+            }
+          : {}),
       }));
     }
 
@@ -164,12 +175,22 @@ export class LoggingInterceptor implements NestInterceptor {
         res.setHeader('X-Trace-Id', traceId);
       }
 
+      const isProduction = process.env.NODE_ENV === 'production';
+      const verboseHttpLogs = process.env.LOG_HTTP_REQUESTS === 'true';
+      const slowThresholdMs = Number(process.env.SLOW_HTTP_LOG_MS || 250);
+
       return next.handle().pipe(
         tap(() => {
           const duration = Date.now() - startTimeMs;
-          this.logger.log(
-            `[traceId=${traceId}] ${method} ${url} - ${duration}ms`,
-          );
+          if (!isProduction || verboseHttpLogs) {
+            this.logger.log(
+              `[traceId=${traceId}] ${method} ${url} - ${duration}ms`,
+            );
+          } else if (duration >= slowThresholdMs) {
+            this.logger.warn(
+              `[traceId=${traceId}] SLOW ${method} ${url} - ${duration}ms`,
+            );
+          }
         }),
       );
     }
@@ -216,4 +237,92 @@ export function withInternalHeaders<T extends Record<string, any>>(
       'x-trace-id': traceId || user?.traceId,
     },
   };
+}
+
+/**
+ * Resolves the JWT signing/verification secret and fails fast in production
+ * if `JWT_ACCESS_SECRET` is omitted, preventing accidental use of a hardcoded dev key.
+ */
+const DEV_FALLBACK_JWT_SECRET = 'super-secret-jwt-access-key-shop-2026';
+
+export function resolveJwtAccessSecret(serviceName = 'service'): string {
+  const secret = process.env.JWT_ACCESS_SECRET?.trim();
+  if (secret) {
+    return secret;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      `[${serviceName}] Fatal security error: JWT_ACCESS_SECRET must be set in production`,
+    );
+  }
+  return DEV_FALLBACK_JWT_SECRET;
+}
+
+/**
+ * Checks whether an error is a Prisma unique constraint violation (P2002),
+ * used by the Inbox Pattern (`ProcessedEvent`) to detect duplicate event delivery.
+ */
+export function isPrismaUniqueConstraintError(err: unknown): boolean {
+  return Boolean(
+    err &&
+      typeof err === 'object' &&
+      'code' in err &&
+      (err as { code?: unknown }).code === 'P2002',
+  );
+}
+
+// ==========================================
+// Shared Readiness Health Indicators
+// ==========================================
+
+@Injectable()
+export class DependencyHealthIndicator extends HealthIndicator {
+  async checkPrisma(
+    key: string,
+    prisma: { $queryRawUnsafe: (query: string) => Promise<unknown> },
+  ): Promise<HealthIndicatorResult> {
+    try {
+      await prisma.$queryRawUnsafe('SELECT 1');
+      return this.getStatus(key, true);
+    } catch (err: any) {
+      throw new HealthCheckError(
+        `${key} check failed`,
+        this.getStatus(key, false, { message: err?.message || 'DB unreachable' }),
+      );
+    }
+  }
+
+  async checkRedis(
+    key: string,
+    pingFn: () => Promise<boolean>,
+  ): Promise<HealthIndicatorResult> {
+    try {
+      const ok = await pingFn();
+      if (!ok) {
+        throw new Error('Redis PING returned false');
+      }
+      return this.getStatus(key, true);
+    } catch (err: any) {
+      throw new HealthCheckError(
+        `${key} check failed`,
+        this.getStatus(key, false, {
+          message: err?.message || 'Redis unreachable',
+        }),
+      );
+    }
+  }
+
+  checkRabbitMQ(
+    key: string,
+    rmq: { isHealthy: () => boolean },
+  ): HealthIndicatorResult {
+    const ok = rmq.isHealthy();
+    if (!ok) {
+      throw new HealthCheckError(
+        `${key} check failed`,
+        this.getStatus(key, false, { message: 'RabbitMQ channel disconnected' }),
+      );
+    }
+    return this.getStatus(key, true);
+  }
 }

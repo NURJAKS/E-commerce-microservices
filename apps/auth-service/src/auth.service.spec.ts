@@ -1,12 +1,15 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import {
+  BadRequestException,
   ConflictException,
+  ForbiddenException,
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { UserRole } from '@shop/contracts';
 import { AuthService } from './auth.service';
+import { generateTotpToken } from './totp.util';
 
 describe('AuthService — Argon2id Password Hashing, JWT (with jti) & Refresh Rotation', () => {
   let authService: AuthService;
@@ -23,13 +26,16 @@ describe('AuthService — Argon2id Password Hashing, JWT (with jti) & Refresh Ro
     mockPrisma = {
       user: {
         findUnique: vi.fn(),
+        findFirst: vi.fn(),
         create: vi.fn(),
+        update: vi.fn(),
       },
       refreshToken: {
         create: vi.fn(),
         findUnique: vi.fn(),
+        findMany: vi.fn().mockResolvedValue([]),
         update: vi.fn(),
-        updateMany: vi.fn(),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
       },
     };
 
@@ -69,9 +75,11 @@ describe('AuthService — Argon2id Password Hashing, JWT (with jti) & Refresh Ro
     const response = await authService.register({
       email: 'NewUser@Example.com',
       password: 'Password123!',
-    });
+      role: UserRole.ADMIN,
+    } as any);
 
     expect(response.user.email).toBe('newuser@example.com');
+    // Security: privilege escalation via self-assigned ADMIN role is blocked
     expect(response.user.role).toBe(UserRole.CUSTOMER);
     expect(response.accessToken).toBeTruthy();
     expect(response.refreshToken).toHaveLength(96);
@@ -181,15 +189,228 @@ describe('AuthService — Argon2id Password Hashing, JWT (with jti) & Refresh Ro
     );
   });
 
-  it('rejects revoked or expired refresh tokens with UnauthorizedException', async () => {
+  it('detects Refresh Token Reuse on a revoked token and revokes the entire session family with JTIs', async () => {
     mockPrisma.refreshToken.findUnique.mockResolvedValue({
       id: 'revoked-rt-id',
+      userId: 'user-reuse-1',
+      familyId: 'fam-stolen-1',
       revoked: true,
       expiresAt: new Date(Date.now() + 86400000),
     });
+    mockPrisma.refreshToken.findMany.mockResolvedValueOnce([
+      { lastAccessJti: 'jti-active-1' },
+      { lastAccessJti: 'jti-active-2' },
+    ]);
 
+    try {
+      await authService.refreshTokens({ refreshToken: 'replayed-token' });
+      expect.unreachable('Should throw UnauthorizedException');
+    } catch (err: any) {
+      expect(err).toBeInstanceOf(UnauthorizedException);
+      const res = err.getResponse();
+      expect(res.reuseDetected).toBe(true);
+      expect(res.revokedJtis).toEqual(['jti-active-1', 'jti-active-2']);
+    }
+
+    expect(mockPrisma.refreshToken.updateMany).toHaveBeenCalledWith({
+      where: { familyId: 'fam-stolen-1' },
+      data: { revoked: true },
+    });
+  });
+
+  it('lists active device sessions, enforces IDOR on session revocation, and revokes all devices', async () => {
+    const rawCurrent = 'my-current-refresh-token';
+    const currentHash = authService.hashRefreshToken(rawCurrent);
+
+    mockPrisma.refreshToken.findMany.mockResolvedValueOnce([
+      {
+        id: 'sess-1',
+        familyId: 'fam-1',
+        tokenHash: currentHash,
+        deviceName: 'Chrome on Linux',
+        userAgent: 'Mozilla/5.0 Chrome/120.0 Linux',
+        ipAddress: '10.0.0.1',
+        createdAt: new Date(),
+        lastUsedAt: new Date(),
+        expiresAt: new Date(Date.now() + 86400000),
+      },
+    ]);
+
+    const sessions = await authService.getActiveSessions('user-1', rawCurrent);
+    expect(sessions).toHaveLength(1);
+    expect(sessions[0].isCurrent).toBe(true);
+    expect(sessions[0].deviceName).toBe('Chrome on Linux');
+
+    // IDOR check: another user cannot revoke sess-1
+    mockPrisma.refreshToken.findUnique.mockResolvedValueOnce({
+      id: 'sess-1',
+      userId: 'user-1',
+      familyId: 'fam-1',
+    });
     await expect(
-      authService.refreshTokens({ refreshToken: 'revoked-token' }),
-    ).rejects.toThrow(UnauthorizedException);
+      authService.revokeSession('attacker-2', 'sess-1'),
+    ).rejects.toThrow(ForbiddenException);
+
+    // Owner revokes single session family
+    mockPrisma.refreshToken.findUnique.mockResolvedValueOnce({
+      id: 'sess-1',
+      userId: 'user-1',
+      familyId: 'fam-1',
+    });
+    mockPrisma.refreshToken.findMany.mockResolvedValueOnce([
+      { lastAccessJti: 'jti-sess-1' },
+    ]);
+    const revoked = await authService.revokeSession('user-1', 'sess-1');
+    expect(revoked).toEqual({ success: true, revokedJtis: ['jti-sess-1'] });
+
+    // Revoke all sessions
+    mockPrisma.refreshToken.findMany.mockResolvedValueOnce([
+      { lastAccessJti: 'jti-a' },
+      { lastAccessJti: 'jti-b' },
+    ]);
+    mockPrisma.refreshToken.updateMany.mockResolvedValueOnce({ count: 2 });
+    const all = await authService.revokeAllSessions('user-1');
+    expect(all).toEqual({
+      success: true,
+      revokedCount: 2,
+      revokedJtis: ['jti-a', 'jti-b'],
+    });
+  });
+
+  it('supports RFC 6238 TOTP 2FA setup, enable, login challenge, and disable', async () => {
+    const hash = await authService.hashPassword('AdminPass123!');
+    mockPrisma.user.findUnique.mockResolvedValueOnce({
+      id: 'admin-1',
+      email: 'admin@shop.local',
+      role: 'ADMIN',
+      passwordHash: hash,
+      totpEnabled: false,
+      totpSecret: null,
+      createdAt: new Date(),
+    });
+    mockPrisma.user.update.mockResolvedValue({});
+
+    const setup = await authService.setupTwoFactor('admin-1');
+    expect(setup.secret).toMatch(/^[A-Z2-7]+$/);
+    expect(setup.otpauthUrl).toContain('otpauth://totp/');
+    expect(setup.qrCodeDataUrl).toMatch(/^data:image\/png;base64,/);
+
+    // Security: TOTP secret persisted to DB must be AES-256-GCM encrypted, never plaintext Base32
+    const persistedSecret = mockPrisma.user.update.mock.calls[0][0].data.totpSecret;
+    expect(persistedSecret).toMatch(/^enc:v1:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+$/);
+    expect(persistedSecret).not.toContain(setup.secret);
+
+    const validCode = generateTotpToken(setup.secret);
+
+    // Reject bad code on enable
+    mockPrisma.user.findUnique.mockResolvedValueOnce({
+      id: 'admin-1',
+      totpSecret: persistedSecret,
+      totpEnabled: false,
+    });
+    await expect(
+      authService.enableTwoFactor('admin-1', '000000'),
+    ).rejects.toThrow(BadRequestException);
+
+    // Accept valid code on enable
+    mockPrisma.user.findUnique.mockResolvedValueOnce({
+      id: 'admin-1',
+      totpSecret: persistedSecret,
+      totpEnabled: false,
+    });
+    const enabled = await authService.enableTwoFactor('admin-1', validCode);
+    expect(enabled.totpEnabled).toBe(true);
+
+    // Login without totpCode returns 2FA_REQUIRED
+    mockPrisma.user.findUnique.mockResolvedValue({
+      id: 'admin-1',
+      email: 'admin@shop.local',
+      role: 'ADMIN',
+      passwordHash: hash,
+      totpEnabled: true,
+      totpSecret: persistedSecret,
+      createdAt: new Date(),
+    });
+    await expect(
+      authService.login({
+        email: 'admin@shop.local',
+        password: 'AdminPass123!',
+      }),
+    ).rejects.toThrow('2FA_REQUIRED');
+
+    // Login with valid totpCode succeeds
+    mockPrisma.refreshToken.create.mockResolvedValue({ id: 'rt-2fa' });
+    const loggedIn = await authService.login({
+      email: 'admin@shop.local',
+      password: 'AdminPass123!',
+      totpCode: validCode,
+    });
+    expect(loggedIn.accessToken).toBeTruthy();
+
+    // Disable 2FA with valid code
+    const disabled = await authService.disableTwoFactor('admin-1', validCode);
+    expect(disabled.totpEnabled).toBe(false);
+  });
+
+  it('registers new users and links existing accounts via Google OAuth 2.0', async () => {
+    // 1. New Google user
+    mockPrisma.user.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.user.create.mockResolvedValueOnce({
+      id: 'google-user-1',
+      email: 'alex@gmail.com',
+      role: 'CUSTOMER',
+      authProvider: 'GOOGLE',
+      googleId: 'g-sub-123',
+      avatarUrl: 'https://lh3.googleusercontent.com/pic.png',
+      totpEnabled: false,
+      createdAt: new Date(),
+    });
+    mockPrisma.refreshToken.create.mockResolvedValue({ id: 'rt-g-1' });
+
+    const newRes = await authService.loginWithGoogle(
+      {
+        googleId: 'g-sub-123',
+        email: 'Alex@Gmail.com',
+        avatarUrl: 'https://lh3.googleusercontent.com/pic.png',
+      },
+      { userAgent: 'Chrome/120 macOS', ipAddress: '1.2.3.4' },
+    );
+
+    expect(newRes.user.authProvider).toBe('GOOGLE');
+    expect(mockRmqService.publish).toHaveBeenCalledWith(
+      'user.registered',
+      expect.objectContaining({ email: 'alex@gmail.com' }),
+    );
+
+    // 2. Existing LOCAL user linked to HYBRID
+    mockRmqService.publish.mockClear();
+    mockPrisma.user.findFirst.mockResolvedValueOnce({
+      id: 'local-user-2',
+      email: 'existing@gmail.com',
+      passwordHash: '$argon2id$...',
+      role: 'CUSTOMER',
+      authProvider: 'LOCAL',
+      googleId: null,
+      avatarUrl: null,
+      createdAt: new Date(),
+    });
+    mockPrisma.user.update.mockResolvedValueOnce({
+      id: 'local-user-2',
+      email: 'existing@gmail.com',
+      role: 'CUSTOMER',
+      authProvider: 'HYBRID',
+      googleId: 'g-sub-456',
+      avatarUrl: 'https://pic',
+      createdAt: new Date(),
+    });
+
+    const linkedRes = await authService.loginWithGoogle({
+      googleId: 'g-sub-456',
+      email: 'existing@gmail.com',
+      avatarUrl: 'https://pic',
+    });
+
+    expect(linkedRes.user.authProvider).toBe('HYBRID');
+    expect(mockRmqService.publish).not.toHaveBeenCalled();
   });
 });

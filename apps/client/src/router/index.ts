@@ -6,6 +6,7 @@ import LoginView from '../views/LoginView.vue';
 import RegisterView from '../views/RegisterView.vue';
 import AdminCatalogView from '../views/AdminCatalogView.vue';
 import SagaMonitorView from '../views/SagaMonitorView.vue';
+import SecurityView from '../views/SecurityView.vue';
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -44,6 +45,11 @@ export const router = createRouter({
       path: '/architecture-monitor',
       name: 'architecture-monitor',
       component: SagaMonitorView,
+    },
+    {
+      path: '/security',
+      name: 'security',
+      component: SecurityView,
     },
   ],
 });

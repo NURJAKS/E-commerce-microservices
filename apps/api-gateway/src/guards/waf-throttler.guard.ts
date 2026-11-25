@@ -25,14 +25,12 @@ export class WafThrottlerGuard implements CanActivate {
 
     const request = context.switchToHttp().getRequest();
     const response = context.switchToHttp().getResponse();
+    // Express resolves `request.ip` safely using `trust proxy = 1` (single Nginx hop), blocking client X-Forwarded-For spoofing
     const ip =
-      (request.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-      request.ip ||
-      '127.0.0.1';
+      request.ip || request.socket?.remoteAddress || '127.0.0.1';
     const path: string = request.url || '';
     const method: string = request.method || 'GET';
 
-    // Strict brute-force limit on Auth login endpoint (max 5 attempts / 60s per IP)
     const isAuthLoginEndpoint =
       method === 'POST' && path.includes('/auth/login');
 

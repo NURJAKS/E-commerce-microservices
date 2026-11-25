@@ -100,8 +100,10 @@ services:
       JWT_REFRESH_TTL_DAYS: "7"
       AUTH_SERVICE_HOST: 0.0.0.0
       AUTH_SERVICE_PORT: "3001"
+      AUTH_HEALTH_PORT: "3101"
+      SEED_DEFAULT_ADMIN: "true"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3001 || exit 1"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3101/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -127,8 +129,11 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       CATALOG_SERVICE_HOST: 0.0.0.0
       CATALOG_SERVICE_PORT: "3002"
+      CATALOG_HEALTH_PORT: "3102"
+      MINIO_PUBLIC_URL: http://localhost:9000
+      MINIO_BUCKET: products-media
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3002 || exit 1"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3102/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -158,8 +163,14 @@ services:
       CATALOG_SERVICE_PORT: "3002"
       ORDER_SERVICE_HOST: 0.0.0.0
       ORDER_SERVICE_PORT: "3003"
+      ORDER_HEALTH_PORT: "3103"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_URL: http://localhost:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_INVOICE_BUCKET: invoices-private
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3003 || exit 1"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3103/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -187,8 +198,12 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       PAYMENT_SERVICE_HOST: 0.0.0.0
       PAYMENT_SERVICE_PORT: "3004"
+      PAYMENT_HEALTH_PORT: "3104"
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost}
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 3004 || exit 1"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3104/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -214,8 +229,13 @@ services:
       SMTP_PORT: "1025"
       SMTP_FROM: no-reply@shop-monorepo.local
       NOTIFICATION_SERVICE_PORT: "3005"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_URL: http://localhost:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_INVOICE_BUCKET: invoices-private
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3005/health"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3005/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -238,6 +258,7 @@ services:
     environment:
       APP_NAME: api-gateway
       API_GATEWAY_PORT: "3000"
+      DISABLE_RATE_LIMIT: ${DISABLE_RATE_LIMIT:-false}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       JWT_ACCESS_SECRET: super-secret-jwt-access-key-shop-2026
@@ -254,9 +275,13 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: products-media
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_CALLBACK_URL: ${GOOGLE_CALLBACK_URL:-http://localhost/api/auth/google/callback}
+      FRONTEND_PUBLIC_URL: ${FRONTEND_PUBLIC_URL:-http://localhost}
     healthcheck:
       test:
-        ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+        ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 12

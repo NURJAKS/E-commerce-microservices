@@ -1,12 +1,16 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
   Get,
+  Headers,
   Inject,
   Param,
   Patch,
   Post,
+  RawBodyRequest,
+  Req,
   UseInterceptors,
 } from '@nestjs/common';
 import { ClientProxy } from '@nestjs/microservices';
@@ -16,14 +20,16 @@ import {
   ApiOperation,
   ApiTags,
 } from '@nestjs/swagger';
+import type { Request } from 'express';
 import { firstValueFrom } from 'rxjs';
-import { CurrentUser, withInternalHeaders } from '@shop/common';
+import { CurrentUser, Public, withInternalHeaders } from '@shop/common';
 import {
   AddCartItemDto,
   CheckoutOrderDto,
   CurrentUserPayload,
   ORDER_PATTERNS,
   PAYMENT_PATTERNS,
+  RequestRefundDto,
   SERVICES,
   UpdateCartItemDto,
 } from '@shop/contracts';
@@ -166,8 +172,111 @@ export class OrderGatewayController {
     return firstValueFrom(
       this.paymentClient.send(
         PAYMENT_PATTERNS.GET_ORDER_PAYMENT,
-        withInternalHeaders({ orderId: id }, user),
+        withInternalHeaders(
+          { orderId: id, userId: user.userId, userRole: user.role },
+          user,
+        ),
       ),
+    );
+  }
+
+  @Get('orders/:id/invoice')
+  @ApiOperation({
+    summary:
+      'Get a 60s Presigned GET URL to download the private PDF receipt (IDOR-protected by order ownership)',
+  })
+  getOrderInvoice(
+    @Param('id') id: string,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return firstValueFrom(
+      this.orderClient.send(
+        ORDER_PATTERNS.GET_INVOICE_URL,
+        withInternalHeaders(
+          {
+            orderId: id,
+            userId: user.userId,
+            userRole: user.role,
+          },
+          user,
+        ),
+      ),
+    );
+  }
+
+  @Post('orders/:id/refund')
+  @UseInterceptors(IdempotencyInterceptor)
+  @ApiHeader({
+    name: 'X-Idempotency-Key',
+    required: false,
+    description: 'UUID for idempotent refund request deduplication in Redis',
+  })
+  @ApiOperation({
+    summary:
+      'Request a refund for a PAID order via Choreography Refund Saga (REFUNDING -> REFUNDED)',
+  })
+  requestRefund(
+    @Param('id') id: string,
+    @Body() dto: RequestRefundDto,
+    @CurrentUser() user: CurrentUserPayload,
+  ) {
+    return firstValueFrom(
+      this.orderClient.send(
+        ORDER_PATTERNS.REQUEST_REFUND,
+        withInternalHeaders(
+          {
+            orderId: id,
+            userId: user.userId,
+            userRole: user.role,
+            userEmail: user.email,
+            reason: dto?.reason,
+          },
+          user,
+        ),
+      ),
+    );
+  }
+
+  @Public()
+  @Post('payments/webhook/stripe')
+  @ApiHeader({
+    name: 'stripe-signature',
+    required: true,
+    description: 'Stripe HMAC-SHA256 webhook signature header',
+  })
+  @ApiOperation({
+    summary:
+      'Receive asynchronous Stripe Checkout webhooks (verifies HMAC Stripe-Signature on raw body + idempotent deduplication)',
+  })
+  handleStripeWebhook(
+    @Req() req: RawBodyRequest<Request>,
+    @Headers('stripe-signature') signature?: string,
+  ) {
+    if (!signature) {
+      throw new BadRequestException('Missing Stripe-Signature header');
+    }
+    const rawBody = req.rawBody
+      ? req.rawBody.toString('utf8')
+      : typeof req.body === 'string'
+        ? req.body
+        : Buffer.isBuffer(req.body)
+          ? req.body.toString('utf8')
+          : '';
+
+    if (!rawBody) {
+      throw new BadRequestException(
+        'Missing raw request body required for Stripe signature verification',
+      );
+    }
+
+    return firstValueFrom(
+      this.paymentClient.send(PAYMENT_PATTERNS.HANDLE_STRIPE_WEBHOOK, {
+        rawBody,
+        signature,
+        __headers: {
+          'x-trace-id': req.headers['x-trace-id'] as string | undefined,
+        },
+      }),
     );
   }
 }

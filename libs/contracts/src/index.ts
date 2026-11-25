@@ -3,7 +3,6 @@ import {
   IsBoolean,
   IsDateString,
   IsEmail,
-  IsEnum,
   IsInt,
   IsNotEmpty,
   IsNumber,
@@ -13,7 +12,7 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 // ==========================================
@@ -30,12 +29,15 @@ export enum OrderStatus {
   PAID = 'PAID',
   FAILED = 'FAILED',
   CANCELLED = 'CANCELLED',
+  REFUNDING = 'REFUNDING',
+  REFUNDED = 'REFUNDED',
 }
 
 export enum PaymentStatus {
   PENDING = 'PENDING',
   SUCCESS = 'SUCCESS',
   FAILED = 'FAILED',
+  REFUNDED = 'REFUNDED',
 }
 
 // ==========================================
@@ -56,6 +58,13 @@ export const AUTH_PATTERNS = {
   REFRESH: 'auth.refresh',
   LOGOUT: 'auth.logout',
   ME: 'auth.me',
+  GET_SESSIONS: 'auth.sessions.list',
+  REVOKE_SESSION: 'auth.sessions.revoke',
+  REVOKE_ALL_SESSIONS: 'auth.sessions.revoke_all',
+  SETUP_2FA: 'auth.2fa.setup',
+  ENABLE_2FA: 'auth.2fa.enable',
+  DISABLE_2FA: 'auth.2fa.disable',
+  OAUTH_GOOGLE_LOGIN: 'auth.oauth.google',
 } as const;
 
 export const CATALOG_PATTERNS = {
@@ -63,11 +72,21 @@ export const CATALOG_PATTERNS = {
   CREATE_CATEGORY: 'catalog.categories.create',
   GET_PRODUCTS: 'catalog.products.list',
   GET_PRODUCT_BY_ID: 'catalog.products.get',
+  AUTOCOMPLETE_PRODUCTS: 'catalog.products.autocomplete',
+  GET_POPULAR_SEARCHES: 'catalog.search.popular',
+  RECORD_PRODUCT_VIEW: 'catalog.products.record_view',
+  GET_RECENTLY_VIEWED: 'catalog.products.recently_viewed',
+  GET_PRODUCT_REVIEWS: 'catalog.reviews.list',
+  CREATE_PRODUCT_REVIEW: 'catalog.reviews.create',
+  SUBSCRIBE_STOCK_ALERT: 'catalog.stock_alert.subscribe',
+  CHECK_STOCK_ALERT: 'catalog.stock_alert.check',
   CREATE_PRODUCT: 'catalog.products.create',
   UPDATE_PRODUCT: 'catalog.products.update',
   DELETE_PRODUCT: 'catalog.products.delete',
   GET_DISCOUNTS: 'catalog.discounts.list',
   CREATE_DISCOUNT: 'catalog.discounts.create',
+  UPDATE_DISCOUNT: 'catalog.discounts.update',
+  DELETE_DISCOUNT: 'catalog.discounts.delete',
   VALIDATE_DISCOUNT: 'catalog.discounts.validate',
   CHECK_STOCK: 'catalog.stock.check',
 } as const;
@@ -81,10 +100,13 @@ export const ORDER_PATTERNS = {
   CHECKOUT: 'order.checkout',
   GET_USER_ORDERS: 'order.list.user',
   GET_ORDER_BY_ID: 'order.get.id',
+  REQUEST_REFUND: 'order.refund.request',
+  GET_INVOICE_URL: 'order.invoice.get_url',
 } as const;
 
 export const PAYMENT_PATTERNS = {
   GET_ORDER_PAYMENT: 'payment.get.byOrder',
+  HANDLE_STRIPE_WEBHOOK: 'payment.webhook.stripe',
 } as const;
 
 // ==========================================
@@ -100,11 +122,6 @@ export class RegisterDto {
   @IsString()
   @MinLength(6)
   password!: string;
-
-  @ApiPropertyOptional({ enum: UserRole, default: UserRole.CUSTOMER })
-  @IsOptional()
-  @IsEnum(UserRole)
-  role?: UserRole;
 }
 
 export class LoginDto {
@@ -116,6 +133,44 @@ export class LoginDto {
   @IsString()
   @IsNotEmpty()
   password!: string;
+
+  @ApiPropertyOptional({
+    example: '123456',
+    description: '6-digit TOTP code from Google Authenticator (when 2FA is enabled)',
+  })
+  @IsOptional()
+  @IsString()
+  totpCode?: string;
+}
+
+export class TotpCodeDto {
+  @ApiProperty({ example: '123456' })
+  @IsString()
+  @IsNotEmpty()
+  code!: string;
+}
+
+export interface SessionMetadata {
+  userAgent?: string;
+  ipAddress?: string;
+}
+
+export interface SessionDto {
+  id: string;
+  familyId: string;
+  deviceName: string;
+  userAgent: string | null;
+  ipAddress: string | null;
+  createdAt: string;
+  lastUsedAt: string;
+  expiresAt: string;
+  isCurrent: boolean;
+}
+
+export interface TotpSetupResponse {
+  secret: string;
+  otpauthUrl: string;
+  qrCodeDataUrl: string;
 }
 
 export class RefreshTokenDto {
@@ -146,6 +201,9 @@ export interface UserDto {
   id: string;
   email: string;
   role: UserRole;
+  authProvider?: string;
+  avatarUrl?: string | null;
+  totpEnabled?: boolean;
   createdAt: string;
 }
 
@@ -269,6 +327,34 @@ export class ProductQueryDto {
   @IsString()
   categoryId?: string;
 
+  @ApiPropertyOptional({ example: 50 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  minPrice?: number;
+
+  @ApiPropertyOptional({ example: 500 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  maxPrice?: number;
+
+  @ApiPropertyOptional({ default: false })
+  @IsOptional()
+  @Transform(({ value }) => value === true || value === 'true' || value === '1')
+  @IsBoolean()
+  inStockOnly?: boolean;
+
+  @ApiPropertyOptional({
+    enum: ['relevance', 'newest', 'price_asc', 'price_desc'],
+    default: 'newest',
+  })
+  @IsOptional()
+  @IsString()
+  sortBy?: 'relevance' | 'newest' | 'price_asc' | 'price_desc';
+
   @ApiPropertyOptional({ default: 1 })
   @IsOptional()
   @Type(() => Number)
@@ -283,6 +369,20 @@ export class ProductQueryDto {
   @Min(1)
   @Max(100)
   limit?: number = 12;
+}
+
+export interface ProductSuggestionDto {
+  id: string;
+  title: string;
+  price: number;
+  stock: number;
+  image?: string;
+  categoryName?: string;
+}
+
+export interface PopularSearchDto {
+  term: string;
+  count: number;
 }
 
 export class CreateDiscountDto {
@@ -314,10 +414,103 @@ export class CreateDiscountDto {
   @IsDateString()
   validUntil!: string;
 
+  @ApiPropertyOptional({
+    example: 100,
+    description: 'Maximum total redemptions across all users (null = unlimited)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  maxUses?: number | null;
+
+  @ApiPropertyOptional({
+    example: 1,
+    description: 'Maximum redemptions per user (null = unlimited)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  maxUsesPerUser?: number | null;
+
   @ApiPropertyOptional({ default: true })
   @IsOptional()
   @IsBoolean()
   isActive?: boolean;
+}
+
+export class UpdateDiscountDto {
+  @ApiPropertyOptional({ example: 15 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(100)
+  percentage?: number;
+
+  @ApiPropertyOptional({ example: 10 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  fixedAmount?: number;
+
+  @ApiPropertyOptional({ example: '2025-01-01T00:00:00.000Z' })
+  @IsOptional()
+  @IsDateString()
+  validFrom?: string;
+
+  @ApiPropertyOptional({ example: '2028-12-31T23:59:59.000Z' })
+  @IsOptional()
+  @IsDateString()
+  validUntil?: string;
+
+  @ApiPropertyOptional({ example: 100 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  maxUses?: number | null;
+
+  @ApiPropertyOptional({ example: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  maxUsesPerUser?: number | null;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
+export class PresignUploadDto {
+  @ApiProperty({ example: 'keyboard-hero.webp' })
+  @IsString()
+  @IsNotEmpty()
+  fileName!: string;
+
+  @ApiProperty({ example: 'image/webp' })
+  @IsString()
+  @IsNotEmpty()
+  contentType!: string;
+
+  @ApiProperty({ example: 245760, description: 'Exact file size in bytes (max 10 MB)' })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10 * 1024 * 1024)
+  sizeBytes!: number;
+}
+
+export interface PresignedUploadResponse {
+  uploadUrl: string;
+  key: string;
+  publicUrl: string;
+  expiresInSeconds: number;
+  requiredHeaders: Record<string, string>;
 }
 
 export interface CategoryDto {
@@ -338,6 +531,73 @@ export interface ProductDto {
   category?: CategoryDto;
   isActive: boolean;
   version?: number;
+  avgRating?: number;
+  reviewsCount?: number;
+}
+
+export class CreateReviewDto {
+  @ApiProperty({ example: 5, minimum: 1, maximum: 5 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(5)
+  rating!: number;
+
+  @ApiProperty({ example: 'Excellent tactile switches and rock-solid build quality.' })
+  @IsString()
+  @MinLength(3)
+  comment!: string;
+}
+
+export interface ReviewDto {
+  id: string;
+  productId: string;
+  userId: string;
+  userEmail: string;
+  rating: number;
+  comment: string;
+  verifiedPurchase: boolean;
+  createdAt: string;
+}
+
+export interface ProductReviewsResponse {
+  productId: string;
+  avgRating: number;
+  reviewsCount: number;
+  canReview: boolean;
+  hasReviewed: boolean;
+  items: ReviewDto[];
+}
+
+export class SubscribeStockAlertDto {
+  @ApiPropertyOptional({ example: 'customer@example.com' })
+  @IsOptional()
+  @IsEmail()
+  email?: string;
+}
+
+export interface StockAlertSubscriber {
+  userId?: string | null;
+  email: string;
+}
+
+export interface ProductRestockedEvent {
+  productId: string;
+  productTitle: string;
+  price: number;
+  stock: number;
+  image?: string;
+  subscribers: StockAlertSubscriber[];
+  restockedAt: string;
+}
+
+export interface ProductRestockedWsPayload {
+  productId: string;
+  productTitle: string;
+  price: number;
+  stock: number;
+  message: string;
+  restockedAt: string;
 }
 
 export interface PaginatedProductsResponse {
@@ -355,6 +615,9 @@ export interface DiscountDto {
   fixedAmount: number;
   validFrom: string;
   validUntil: string;
+  maxUses: number | null;
+  maxUsesPerUser: number | null;
+  usedCount: number;
   isActive: boolean;
 }
 
@@ -364,6 +627,19 @@ export interface ValidateDiscountResult {
   percentage: number;
   fixedAmount: number;
   reason?: string;
+}
+
+export interface StockCheckQuotedItem {
+  productId: string;
+  productTitle: string;
+  unitPrice: number;
+  quantity: number;
+}
+
+export interface StockCheckResponse {
+  available: boolean;
+  unavailableItem?: string;
+  quotedItems?: StockCheckQuotedItem[];
 }
 
 // ==========================================
@@ -434,6 +710,13 @@ export class CheckoutOrderDto {
   discountCode?: string;
 }
 
+export class RequestRefundDto {
+  @ApiPropertyOptional({ example: 'Item no longer needed' })
+  @IsOptional()
+  @IsString()
+  reason?: string;
+}
+
 export interface OrderItemDto {
   id: string;
   orderId: string;
@@ -449,8 +732,22 @@ export interface OrderDto {
   status: OrderStatus;
   totalAmount: number;
   discountCode: string | null;
+  invoiceKey?: string | null;
   createdAt: string;
   items: OrderItemDto[];
+}
+
+export interface InvoiceDownloadResponse {
+  downloadUrl: string;
+  fileName: string;
+  expiresInSeconds: number;
+}
+
+export interface InvoiceGeneratedEvent {
+  orderId: string;
+  userId: string;
+  invoiceKey: string;
+  generatedAt: string;
 }
 
 export interface PaymentDto {
@@ -459,7 +756,12 @@ export interface PaymentDto {
   userId: string;
   amount: number;
   status: PaymentStatus;
+  provider?: string;
   transactionId: string | null;
+  stripeSessionId?: string | null;
+  checkoutUrl?: string | null;
+  refundTransactionId?: string | null;
+  refundedAt?: string | null;
   createdAt: string;
 }
 
@@ -514,6 +816,7 @@ export interface PaymentSucceededEvent {
   orderId: string;
   userId: string;
   userEmail?: string;
+  items?: SagaOrderItem[];
   amount: number;
   transactionId: string;
   paidAt: string;
@@ -536,6 +839,28 @@ export interface OrderCancelledEvent {
   userEmail?: string;
   reason: string;
   cancelledAt: string;
+}
+
+export interface OrderRefundRequestedEvent {
+  orderId: string;
+  userId: string;
+  userEmail?: string;
+  items: SagaOrderItem[];
+  amount: number;
+  reason: string;
+  requestedAt: string;
+}
+
+export interface PaymentRefundedEvent {
+  paymentId: string;
+  orderId: string;
+  userId: string;
+  userEmail?: string;
+  items: SagaOrderItem[];
+  amount: number;
+  refundTransactionId: string;
+  reason: string;
+  refundedAt: string;
 }
 
 export interface OrderStatusUpdatedWsPayload {

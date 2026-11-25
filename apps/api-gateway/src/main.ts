@@ -18,7 +18,12 @@ async function bootstrap() {
     .split(',')
     .map((o) => o.trim());
 
-  const app = await NestFactory.create(GatewayModule);
+  // rawBody: true preserves exact HTTP body bytes needed for Stripe-Signature HMAC verification
+  const app = await NestFactory.create(GatewayModule, { rawBody: true });
+  // Trust only the configured reverse proxy hops (1 = Nginx; 2 = Caddy/CDN + Nginx) so clients cannot spoof X-Forwarded-For
+  const trustProxyHops = Number(process.env.TRUST_PROXY_HOPS || 1);
+  (app as any).set('trust proxy', trustProxyHops);
+  app.enableShutdownHooks();
   app.setGlobalPrefix('api');
 
   // Security Headers (Helmet: HSTS, X-Frame-Options, X-Content-Type-Options, XSS Filter)
@@ -39,6 +44,7 @@ async function bootstrap() {
       'Authorization',
       'X-Idempotency-Key',
       'X-Trace-Id',
+      'X-Viewer-Id',
     ],
     exposedHeaders: ['X-Trace-Id', 'X-Idempotency-Replayed'],
   });

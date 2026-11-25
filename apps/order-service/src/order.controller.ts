@@ -4,6 +4,7 @@ import {
   AddCartItemDto,
   ORDER_PATTERNS,
   UpdateCartItemDto,
+  UserRole,
 } from '@shop/contracts';
 import { AllRpcExceptionFilter, LoggingInterceptor } from '@shop/common';
 import { CartService } from './cart.service';
@@ -73,5 +74,43 @@ export class OrderController {
   @MessagePattern(ORDER_PATTERNS.GET_ORDER_BY_ID)
   getOrderById(@Payload() data: { orderId: string; userId?: string }) {
     return this.orderService.getOrderById(data.orderId, data.userId);
+  }
+
+  @MessagePattern(ORDER_PATTERNS.REQUEST_REFUND)
+  requestRefund(
+    @Payload()
+    data: {
+      orderId: string;
+      userId: string;
+      userRole?: UserRole;
+      userEmail?: string;
+      reason?: string;
+      __headers?: { 'x-trace-id'?: string };
+    },
+  ) {
+    return this.orderService.requestRefund(
+      data.orderId,
+      data.userId,
+      data.userRole,
+      data.userEmail,
+      data.reason,
+      data.__headers?.['x-trace-id'],
+    );
+  }
+
+  @MessagePattern(ORDER_PATTERNS.GET_INVOICE_URL)
+  getInvoiceDownloadUrl(
+    @Payload()
+    data: {
+      orderId: string;
+      userId: string;
+      userRole?: UserRole;
+    },
+  ) {
+    return this.orderService.getInvoiceDownloadUrl(
+      data.orderId,
+      data.userId,
+      data.userRole,
+    );
   }
 }

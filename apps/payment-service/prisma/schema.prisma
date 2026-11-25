@@ -12,17 +12,37 @@ enum PaymentStatus {
   PENDING
   SUCCESS
   FAILED
+  REFUNDED
 }
 
 model Payment {
-  id            String        @id @default(uuid()) @db.Uuid
-  orderId       String        @db.Uuid
-  userId        String        @db.Uuid
-  amount        Decimal       @db.Decimal(12, 2)
-  status        PaymentStatus @default(PENDING)
-  transactionId String?
-  createdAt     DateTime      @default(now())
+  id                    String        @id @default(uuid()) @db.Uuid
+  orderId               String        @db.Uuid
+  userId                String        @db.Uuid
+  userEmail             String?
+  amount                Decimal       @db.Decimal(12, 2)
+  status                PaymentStatus @default(PENDING)
+  provider              String        @default("MOCK")
+  transactionId         String?
+  stripeSessionId       String?
+  stripePaymentIntentId String?
+  checkoutUrl           String?
+  itemsPayload          Json?
+  refundTransactionId   String?
+  refundedAt            DateTime?
+  createdAt             DateTime      @default(now())
 
   @@index([orderId])
   @@index([userId])
+  @@index([stripeSessionId])
+  @@index([orderId, status])
+  @@index([orderId, createdAt(sort: Desc)])
+}
+
+model ProcessedEvent {
+  eventId     String   @id
+  eventType   String
+  processedAt DateTime @default(now())
+
+  @@index([processedAt])
 }

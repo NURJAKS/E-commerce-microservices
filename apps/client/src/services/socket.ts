@@ -1,6 +1,9 @@
 import { io, Socket } from 'socket.io-client';
 import { ref } from 'vue';
-import type { OrderStatusUpdatedWsPayload } from '@shop/contracts';
+import type {
+  OrderStatusUpdatedWsPayload,
+  ProductRestockedWsPayload,
+} from '@shop/contracts';
 import { useToastStore } from '../stores/toast.store';
 
 export interface SagaCheckoutInitiatedPayload {
@@ -65,6 +68,10 @@ class SocketManager {
         const toastStore = useToastStore();
         if (payload.status === 'PAID') {
           toastStore.show('Order Paid!', payload.message, 'success');
+        } else if (payload.status === 'REFUNDED') {
+          toastStore.show('Order Refunded', payload.message, 'success');
+        } else if (payload.status === 'REFUNDING') {
+          toastStore.show('Refund Processing', payload.message, 'info');
         } else if (
           payload.status === 'FAILED' ||
           payload.status === 'CANCELLED'
@@ -77,6 +84,14 @@ class SocketManager {
         for (const listener of this.listeners) {
           listener(payload);
         }
+      },
+    );
+
+    this.socket.on(
+      'notification:product_restocked',
+      (payload: ProductRestockedWsPayload) => {
+        const toastStore = useToastStore();
+        toastStore.show('Back in Stock!', payload.message, 'success');
       },
     );
   }

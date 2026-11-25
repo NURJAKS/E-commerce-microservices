@@ -13,6 +13,8 @@ enum OrderStatus {
   PAID
   FAILED
   CANCELLED
+  REFUNDING
+  REFUNDED
 }
 
 model Order {
@@ -21,11 +23,14 @@ model Order {
   status       OrderStatus @default(PENDING)
   totalAmount  Decimal     @db.Decimal(12, 2)
   discountCode String?
+  invoiceKey   String?
   createdAt    DateTime    @default(now())
   items        OrderItem[]
 
   @@index([userId])
   @@index([status])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status, createdAt])
 }
 
 model OrderItem {
@@ -52,4 +57,12 @@ model Outbox {
   publishedAt DateTime?
 
   @@index([published, createdAt])
+}
+
+model ProcessedEvent {
+  eventId     String   @id
+  eventType   String
+  processedAt DateTime @default(now())
+
+  @@index([processedAt])
 }

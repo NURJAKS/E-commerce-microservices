@@ -56,6 +56,13 @@ async function handleLogout() {
             >
               Admin &amp; MinIO Upload
             </router-link>
+            <router-link
+              v-if="authStore.isAuthenticated"
+              to="/security"
+              class="hover:text-white transition"
+            >
+              Security &amp; Sessions
+            </router-link>
           </nav>
         </div>
 
